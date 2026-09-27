@@ -24,6 +24,8 @@
 #include "jversion.h"           /* for version message */
 #include "jconfigint.h"
 
+#include <unistd.h>
+#include <errno.h>
 
 /*
  * Argument-parsing code.
@@ -46,7 +48,8 @@ static boolean report;          /* for -report switch */
 static boolean strict;          /* for -strict switch */
 static JCOPY_OPTION copyoption; /* -copy switch */
 static jpeg_transform_info transformoption; /* image transformation options */
-
+static int do_fsync;
+static int do_temp;
 
 LOCAL(void)
 usage(void)
@@ -97,6 +100,8 @@ usage(void)
   fprintf(stderr, "  -nooverwrite   Don't overwrite output file if it exists\n");
   fprintf(stderr, "  -report        Report transformation progress\n");
   fprintf(stderr, "  -strict        Treat all warnings as fatal\n");
+  fprintf(stderr, "  -fsync         fsync output file prior to closing\n");
+  fprintf(stderr, "  -temp          write output to temp file and replace original input\n");
   fprintf(stderr, "  -verbose  or  -debug   Emit debug output\n");
   fprintf(stderr, "  -version       Print version information and exit\n");
   fprintf(stderr, "Switches for wizards:\n");
@@ -327,6 +332,14 @@ parse_switches(j_compress_ptr cinfo, int argc, char **argv,
         usage();
       outfilename = argv[argn]; /* save it away for later use */
 
+    } else if (keymatch(arg, "fsync", 2)) {
+      /* Set fsync flag */
+      do_fsync = 1;
+
+    } else if (keymatch(arg, "temp", 2)) {
+      /* Set temp flag */
+      do_temp = 1;
+
     } else if (keymatch(arg, "nooverwrite", 1)) {
       nooverwrite = TRUE;
 
@@ -500,6 +513,7 @@ main(int argc, char **argv)
   jvirt_barray_ptr *src_coef_arrays;
   jvirt_barray_ptr *dst_coef_arrays;
   int file_index;
+  int inputfile_index;
   /* We assume all-in-memory processing and can therefore use only a
    * single file pointer for sequential input and output operation.
    */
@@ -507,6 +521,8 @@ main(int argc, char **argv)
   FILE *icc_file;
   JOCTET *icc_profile = NULL;
   long icc_len = 0;
+  int ioerror = 0;
+  char outtemp[4096];
 
   progname = argv[0];
   if (progname == NULL || progname[0] == 0)
@@ -565,7 +581,13 @@ main(int argc, char **argv)
               argv[file_index]);
       exit(EXIT_FAILURE);
     }
+    inputfile_index = file_index;
   } else {
+    if (do_temp) {
+      fprintf(stderr, "%s: temp mode can not be used when reading "
+              "from stdin\n", progname);
+      exit(EXIT_FAILURE);
+    }
     /* default input file is stdin */
     fp = read_stdin();
   }
@@ -693,6 +715,10 @@ main(int argc, char **argv)
 
   /* Open the output file. */
   if (outfilename != NULL) {
+    if (do_temp) {
+      fprintf(stderr, "%s: outfile parameter incompatible with temp mode\n", progname);
+      exit(EXIT_FAILURE);
+    }
     if (nooverwrite && (fp = fopen(outfilename, READ_BINARY)) != NULL) {
       fclose(fp);
       fprintf(stderr, "%s: can't open %s; file exists\n", progname, outfilename);
@@ -703,6 +729,29 @@ main(int argc, char **argv)
               outfilename);
       exit(EXIT_FAILURE);
     }
+  } else if (do_temp) {
+    int fd;
+    int snret;
+
+    snret = snprintf(outtemp, sizeof(outtemp), "%s.tmp.XXXXXX", argv[inputfile_index]);
+    if (snret < 0 || snret >= sizeof(outtemp)) {
+      fprintf(stderr, "%s: snprintf buffer overflow\n", progname);
+      exit(EXIT_FAILURE);
+    }
+    fd = mkstemp(outtemp);
+    if (fd == -1) {
+      fprintf(stderr, "%s: can't open temporary file: %s\n",
+              progname, strerror(errno));
+      exit(EXIT_FAILURE);
+    }
+    fp = fdopen(fd, WRITE_BINARY);
+    outfilename = outtemp;
+    if (fp == NULL) {
+      unlink(outtemp);
+      fprintf(stderr, "%s: can't fdopen temporary file: %s\n",
+              progname, strerror(errno));
+      exit(EXIT_FAILURE);
+    }
   } else {
     /* default output file is stdout */
     fp = write_stdout();
@@ -710,6 +759,8 @@ main(int argc, char **argv)
 
   /* Adjust default compression parameters by re-parsing the options */
   file_index = parse_switches(&dstinfo, argc, argv, 0, TRUE);
+  if (do_temp)
+    outfilename = outtemp;
 
   /* Specify data destination for compression */
   jpeg_stdio_dest(&dstinfo, fp);
@@ -741,9 +792,38 @@ main(int argc, char **argv)
   (void)jpeg_finish_decompress(&srcinfo);
   jpeg_destroy_decompress(&srcinfo);
 
+  if (fflush(fp) == EOF) {
+    fprintf(stderr, "%s: failed to write to %s: %s\n",
+            progname, outfilename ? outfilename : "stdout", strerror(errno));
+    ioerror = 1;
+  }
+  if (do_fsync && (fsync(fileno(fp)) == -1)) {
+    if (errno != EINVAL) {
+      fprintf(stderr, "%s: failed to fsync %s: %s\n",
+              progname, outfilename ? outfilename : "stdout", strerror(errno));
+      ioerror = 1;
+    }
+  }
   /* Close output file, if we opened it */
-  if (fp != stdout)
-    fclose(fp);
+  if (fp != stdout) {
+    if (fclose(fp) == EOF) {
+      fprintf(stderr, "%s: failed to close %s: %s\n",
+              progname, outfilename ? outfilename : "stdout", strerror(errno));
+      ioerror = 1;
+    }
+    if (do_temp) {
+      if (!ioerror) {
+        if (rename(outtemp, argv[inputfile_index]) == -1) {
+          fprintf(stderr, "%s: failed to rename %s to %s: %s\n",
+                  progname, outtemp, argv[inputfile_index], strerror(errno));
+          ioerror = 1;
+          unlink(outtemp);
+        }
+      } else {
+        unlink(outtemp);
+      }
+    }
+  }
 #if TRANSFORMS_SUPPORTED
   if (drop_file != NULL)
     fclose(drop_file);
@@ -759,10 +839,10 @@ main(int argc, char **argv)
   /* All done. */
 #if TRANSFORMS_SUPPORTED
   if (dropfilename != NULL)
-    exit(jsrcerr.num_warnings + jdroperr.num_warnings +
-         jdsterr.num_warnings ? EXIT_WARNING : EXIT_SUCCESS);
+    exit((jsrcerr.num_warnings + jdroperr.num_warnings +
+          jdsterr.num_warnings || ioerror) ? EXIT_WARNING : EXIT_SUCCESS);
 #endif
-  exit(jsrcerr.num_warnings + jdsterr.num_warnings ?
+  exit((jsrcerr.num_warnings + jdsterr.num_warnings || ioerror) ?
        EXIT_WARNING : EXIT_SUCCESS);
   return 0;                     /* suppress no-return-value warnings */
 }

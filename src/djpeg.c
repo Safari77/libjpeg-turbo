@@ -38,7 +38,8 @@
 #include "jconfigint.h"
 
 #include <ctype.h>              /* to declare isprint() */
-
+#include <unistd.h>
+#include <errno.h>
 
 /* Create the add-on message string table. */
 
@@ -49,6 +50,7 @@ static const char * const cdjpeg_message_table[] = {
   NULL
 };
 
+static boolean do_fsync;
 
 /*
  * This list defines the known output image formats
@@ -176,6 +178,7 @@ usage(void)
   fprintf(stderr, "  -maxmemory N   Maximum memory to use (in kbytes)\n");
   fprintf(stderr, "  -maxscans N    Maximum number of scans to allow in input file\n");
   fprintf(stderr, "  -outfile name  Specify name for output file\n");
+  fprintf(stderr, "  -fsync         fsync output file prior to closing\n");
   fprintf(stderr, "  -nooverwrite   Don't overwrite output file if it exists\n");
   fprintf(stderr, "  -memsrc        Load input file into memory before decompressing\n");
   fprintf(stderr, "  -report        Report decompression progress\n");
@@ -403,6 +406,10 @@ parse_switches(j_decompress_ptr cinfo, int argc, char **argv,
       /* Use in-memory source manager */
       memsrc = TRUE;
 
+    } else if (keymatch(arg, "fsync", 2)) {
+      /* Set fsync flag */
+      do_fsync = 1;
+
     } else if (keymatch(arg, "pnm", 1) || keymatch(arg, "ppm", 1)) {
       /* PPM/PGM output format. */
       requested_fmt = FMT_PPM;
@@ -580,6 +587,7 @@ main(int argc, char **argv)
   unsigned char *inbuffer = NULL;
   unsigned long insize = 0;
   JDIMENSION num_scanlines;
+  int ioerror = 0;
 
   progname = argv[0];
   if (progname == NULL || progname[0] == 0)
@@ -993,8 +1001,24 @@ main(int argc, char **argv)
   /* Close files, if we opened them */
   if (input_file != stdin)
     fclose(input_file);
+  if (fflush(output_file) == EOF) {
+    fprintf(stderr, "%s: failed to write to %s: %s\n",
+            progname, outfilename, strerror(errno));
+    ioerror = 1;
+  }
+  if (do_fsync && (fsync(fileno(output_file)) == -1)) {
+    if (errno != EINVAL) {
+      fprintf(stderr, "%s: failed to fsync %s: %s\n",
+              progname, outfilename, strerror(errno));
+      ioerror = 1;
+    }
+  }
   if (output_file != stdout)
-    fclose(output_file);
+    if (fclose(output_file) == EOF) {
+      fprintf(stderr, "%s: failed to close %s: %s\n",
+              progname, outfilename, strerror(errno));
+      ioerror = 1;
+    }
 
   if (report || max_scans != 0)
     end_progress_monitor((j_common_ptr)&cinfo);
@@ -1003,6 +1027,6 @@ main(int argc, char **argv)
     free(inbuffer);
 
   /* All done. */
-  exit(jerr.num_warnings ? EXIT_WARNING : EXIT_SUCCESS);
+  exit((jerr.num_warnings || ioerror) ? EXIT_WARNING : EXIT_SUCCESS);
   return 0;                     /* suppress no-return-value warnings */
 }

@@ -41,6 +41,8 @@
 #include "jversion.h"           /* for version message */
 #include "jconfigint.h"
 
+#include <unistd.h>
+#include <errno.h>
 
 /* Create the add-on message string table. */
 
@@ -79,7 +81,7 @@ static const char * const cdjpeg_message_table[] = {
  */
 
 static boolean is_targa;        /* records user -targa switch */
-
+static boolean do_fsync;
 
 LOCAL(cjpeg_source_ptr)
 select_file_type(j_compress_ptr cinfo, FILE *infile)
@@ -269,6 +271,7 @@ usage(void)
 #endif
   fprintf(stderr, "  -maxmemory N   Maximum memory to use (in kbytes)\n");
   fprintf(stderr, "  -outfile name  Specify name for output file\n");
+  fprintf(stderr, "  -fsync         fsync output file prior to closing\n");
   fprintf(stderr, "  -nooverwrite   Don't overwrite output file if it exists\n");
   fprintf(stderr, "  -memdst        Compress to memory instead of file (useful for benchmarking)\n");
   fprintf(stderr, "  -report        Report compression progress\n");
@@ -461,6 +464,10 @@ parse_switches(j_compress_ptr cinfo, int argc, char **argv,
       if (++argn >= argc)       /* advance to next argument */
         usage();
       outfilename = argv[argn]; /* save it away for later use */
+
+    } else if (keymatch(arg, "fsync", 2)) {
+      /* Set fsync flag */
+      do_fsync = 1;
 
     } else if (keymatch(arg, "nooverwrite", 3)) {
       nooverwrite = TRUE;
@@ -676,6 +683,7 @@ main(int argc, char **argv)
   unsigned char *outbuffer = NULL;
   unsigned long outsize = 0;
   JDIMENSION num_scanlines;
+  int ioerror = 0;
 
   progname = argv[0];
   if (progname == NULL || progname[0] == 0)
@@ -883,9 +891,26 @@ main(int argc, char **argv)
   if (input_file != stdin)
     fclose(input_file);
 #endif
-  if (output_file != stdout && output_file != NULL)
-    fclose(output_file);
-
+  if (fflush(output_file) == EOF) {
+    fprintf(stderr, "%s: failed to write to %s: %s\n",
+            progname, outfilename, strerror(errno));
+    ioerror = 1;
+  }
+  if (do_fsync && (fsync(fileno(output_file)) == -1)) {
+    if (errno != EINVAL) {
+      fprintf(stderr, "%s: failed to fsync %s: %s\n",
+              progname, outfilename, strerror(errno));
+      ioerror = 1;
+    }
+  }
+  if (output_file != stdout && output_file != NULL) {
+    if (fclose(output_file) == EOF) {
+      fprintf(stderr, "%s: failed to close %s: %s\n",
+              progname, outfilename, strerror(errno));
+      ioerror = 1;
+    }
+  }
+ 
   if (report)
     end_progress_monitor((j_common_ptr)&cinfo);
 
@@ -899,5 +924,5 @@ main(int argc, char **argv)
   free(icc_profile);
 
   /* All done. */
-  return (jerr.num_warnings ? EXIT_WARNING : EXIT_SUCCESS);
+  return ((jerr.num_warnings || ioerror) ? EXIT_WARNING : EXIT_SUCCESS);
 }
